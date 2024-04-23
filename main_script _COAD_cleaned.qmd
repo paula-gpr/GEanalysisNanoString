@@ -1,0 +1,611 @@
+---
+title: "data_sorting"
+format: html
+editor: visual
+---
+
+# *Load packages*
+
+```{r}
+library(jsonlite)
+library("magrittr")
+library(dplyr) #grammar of data manipulation
+library(tidyr)
+library(readr) #to read csv and tsv
+library(purrr)
+library(readxl)
+library(data.table) #faster than dataframes!
+library(DESeq2)
+library(pheatmap)
+
+```
+
+# ***Data Preparation***
+
+**Metadata for COAD**
+
+This metadata is downloaded from the TCGA portal upon download of the data. The code assumes that the metadata is in JSON format.
+
+We are interested in the file-TCGA ID relationship. For that, we extract the associated entities file, that contains the entity_submitter_id, the field in which this information is stored. The code loops through the associated_entities, retrieves the entity_submitter_ids and appends it to a final list.
+
+```{r}
+metadata_COAD <- fromJSON("C:\\Users\\pgome\\Desktop\\DTU\\segundo cuatri\\Special Course\\metadata_COAD.json")
+
+list_of_IDs <- metadata_COAD[ ,"associated_entities"]
+
+entity_submitter_ids <- c()
+
+for (i in seq_along(list_of_IDs)) {
+  entity_submitter_ids <- c(entity_submitter_ids, list_of_IDs[[i]]$entity_submitter_id)
+}
+
+metadata_COAD <-data.frame(entity_submitter_ids,metadata_COAD$file_name)
+
+colnames(metadata_COAD)<-c("associated_entities", "file_name")
+```
+
+## Get prognosis information
+
+The file is downloaded from the UCSC Xena: <https://xenabrowser.net/datapages/?dataset=survival%2FCOADREAD_survival.txt&host=https%3A%2F%2Ftcga.xenahubs.net&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443>
+
+We are interested in the field DFI, since it is the most similar marker to prognosis. For DFI, we have that 1 means that the event has occurred, 0 that it hasn't. We want to only get the information from the patients that have non-NAs in the DFI field.
+
+```{r}
+prognosis_unfiltered  <- read.delim('survival_COADREAD_survival.txt')
+
+prognosis_filtered <- read.delim('survival_COADREAD_survival.txt') %>%
+  filter(!is.na(DFI))
+```
+
+## Open all the files, store them in a dataframe
+
+My Data folder has data for both COAD (/Data/COAD) and READ (/Data/READ). Inside each of these folders, I have more folders that contain one file of data each. This works because there is only one file in each folder. COAD_data will have the information for all of the files appended to it.
+
+```{r}
+subdirectories_coad <- list.dirs('./Data/COAD')
+
+#Remove root directory from the variable
+subdirectories_coad <-subdirectories_coad[2:525]
+
+COAD_data <- data.frame()
+
+for (x in subdirectories_coad){
+  
+  #Full path to the file
+  file_name <- list.files(x, pattern="\\.tsv")
+  full_path <-paste(x, file_name, sep="/")
+  full_path <- substr(full_path, 3, nchar(full_path))
+  
+  #Open file
+  tsv_file <- read_tsv(full_path, skip=1) 
+
+  #Column with the file name
+  tsv_file$file_id <-file_name
+  
+  COAD_data <- rbind(COAD_data,tsv_file)
+
+}
+
+```
+
+Load the data so that the above commands do not have to be read always.
+
+```{r}
+COAD_data <- read_csv('COAD_data_no_processing.csv')
+```
+
+Check the number of unique samples found in COAD, for comparison purposes that were needed for the report.
+
+```{r}
+number_samples_COAD <- substr(metadata_COAD$associated_entities, 1, 15)
+number_samples_COAD <- unique(number_samples_COAD)
+```
+
+# *Filtering and reshaping*
+
+#### **Information of non-NAs of DFI only**
+
+Copy the original dataframe and filter it by removing unnecessary lines.
+
+```{r}
+#Copy the dataframe
+COAD_data_filtered <- COAD_data
+
+#Filter
+COAD_data_filtered <- COAD_data_filtered  %>%
+  filter(gene_id != "N_unmapped" & 
+         gene_id != "N_multimapping" & 
+         gene_id != "N_noFeature" & 
+         gene_id != "N_ambiguous")
+
+```
+
+We need to add the TCGA ID to each of the files, that we will get from the metadata_COAD dataframe. In here, a "translation table" (concept from the Python class) is created using setNames, such that the objects in associated_entities are given a name (from file_name), and this file_name is included in a column in the main dataframe called patient_id.
+
+```{r}
+lookup_table <- setNames(metadata_COAD$associated_entities, metadata_COAD$file_name)
+
+COAD_data_filtered$patient_id <- lookup_table[COAD_data_filtered$file_id]
+
+```
+
+We need shorter versions of the patient_id, to look up in the other dataframes where we have information.
+
+```{r}
+
+COAD_data_filtered$patient_id_long <- substr(COAD_data_filtered$patient_id, 1, 15)
+
+COAD_data_filtered$patient_id_short <- substr(COAD_data_filtered$patient_id, 1, 12)
+```
+
+Retrieve which patients have information for DFI. Filter the COAD_data_filtered dataframe to only contain information about this subset of patients.
+
+```{r}
+
+COAD_patients_DFI <- prognosis_filtered$X_PATIENT
+
+COAD_data_filtered <- COAD_data_filtered %>%
+  filter(patient_id_short %in% COAD_patients_DFI)
+```
+
+Add a "recurrence column" that has a value of 1 if DFI=1 for that patient, and 0 if DFI=0 for that patient.
+
+```{r}
+COAD_data_filtered$recurrence <- 0
+
+#Update value of column if necessary
+COAD_data_filtered$recurrence[COAD_data_filtered$patient_id_short %in% rec_DFI$X_PATIENT] <- 1
+```
+
+#### Only get protein_coding genes
+
+We are only interested in the protein coding genes, so I am removing those that are not protein coding.
+
+```{r}
+COAD_data_filtered <- COAD_data_filtered  %>% 
+  filter(gene_type=='protein_coding')
+
+```
+
+#### Transformation into a count matrix format
+
+In order to submit our data to DESeq2, we will have to put the data in a count matrix format, in which we have genes in the rows and TCGA samples in the columns.
+
+To comply with this structure, we need to merge technical replicates (same sample, different vials).
+
+![](images/Captura%20de%20pantalla%202024-04-02%20111411.png){width="340"}
+
+The same samples are going to have the same patient_id_long (shown as the first example of the barcode examples), so we have to group the samples by the patient_id_long.
+
+The code proceeds as follows. It selects the columns of the COAD_data_filtered that are relevant for the count matrix. It lengthens the data to merge technical replicates, merges the technical replicates and then it widens the data to its original format. Finally, it manages some formatting issues that come up with the formatting, such that the rows have the names of the genes.
+
+```{r}
+
+selected_df <- COAD_data_filtered %>% 
+  select(unstranded, gene_id, patient_id_long)
+  
+# Reshape the data to merge technical replicates
+
+# Lengthen the data 
+count_df_long <- selected_df %>%
+  pivot_longer(cols = unstranded, names_to = "Unstranded", values_to = "Counts")
+
+# Merge technical replicates
+count_df_long_sum <- count_df_long %>%
+  group_by(patient_id_long, gene_id) %>%
+  summarize(count = sum(Counts))
+
+# Widen to count matrix format
+count_df_wide <- count_df_long_sum %>%
+  pivot_wider(names_from = patient_id_long, values_from = count)
+
+# Set row names to gene names
+rownames(count_df_wide) <- count_df_wide$gene_id
+
+#Fix formatting of the count matrix
+cts <- subset(count_df_wide, select = -c(gene_id))
+
+rownames(cts) <- count_df_wide$gene_id
+```
+
+In the current count matrix we have the gene_id but we need it to be mapped to the gene_names.
+
+```{r}
+gene_mapping <- COAD_data_filtered %>%
+  distinct(gene_id, gene_name)
+```
+
+The following code maps the gene_id to a gene_name by lengthening the dataframe and then it merges the gene names that map to more than one gene_id. Then it goes back to the original count matrix format.
+
+```{r}
+cts_new <- cts
+
+cts_new$gene_id <- row.names(cts)  
+
+#Lengthen the data
+cts_long <- cts_new %>%
+  pivot_longer(cols = -gene_id, names_to = "patient_id", values_to = "Counts_longer")
+
+#Mapping
+cts_mapped <- cts_long %>%
+  left_join(gene_mapping, by = "gene_id")
+
+#Merge genes_name that map to more than one gene_id
+cts_mapped_sum <- cts_mapped %>%
+  group_by(gene_name, patient_id)%>%
+  summarize(count_summed = sum(Counts_longer))
+
+#Back to the original format by widening the dataframe.
+cts_wide <- cts_mapped_sum %>%
+  pivot_wider(names_from = "patient_id", values_from = "count_summed")
+
+#Fix formatting issues
+cts_wide_withnames <- subset(cts_wide, select = -c(gene_name))
+
+rownames(cts_wide_withnames) <- cts_wide$gene_name
+
+```
+
+The result of this is a bit less than 20k protein coding genes, which are the amount of protein coding genes that there are in humans, and 206 samples.
+
+# *DESeq2*
+
+Formatting of the dataframe so that it can be used in DESeq2 (code from: <https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#countmat>)
+
+```{r}
+df_cts <- apply(cts_wide_withnames,2,as.character)
+
+coldata <- dplyr::distinct(COAD_data_filtered, patient_id_long, recurrence)
+
+coldata$recurrence <- factor(coldata$recurrence)
+
+dds <- DESeqDataSetFromMatrix(countData = cts_wide_withnames,
+                              colData = coldata,
+                              design = ~ recurrence)
+dds
+```
+
+Normalization of the counts, for subsequent steps in the analysis, not for running DESeq2, since the counts need to be unnormalized. (code from: <https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#countmat>)
+
+```{r}
+dds_normalized <- estimateSizeFactors(dds)
+sizeFactors(dds_normalized)
+normalized_counts <- counts(dds_normalized, normalized=TRUE)
+write.table(normalized_counts, file="data/normalized_counts.txt", sep="\t", quote=F, col.names=NA)
+```
+
+Run DESeq (code from: <https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#countmat>)
+
+```{r}
+dds <- DESeq(dds)
+res <- results(dds, contrast=c("recurrence",1,0))
+
+res$padj <- p.adjust(res$pvalue, method = "BH")  
+```
+
+#### **Analysis of the results:**
+
+Shrink the log2fold changes. (code from: <https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#countmat>)
+
+```{r}
+resultsNames(dds)
+resLFC <- lfcShrink(dds, coef="recurrence_1_vs_0", type="apeglm")
+resLFC
+```
+
+Order the dataframe by using the adjusted pvalues. (code from: <https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#countmat>)
+
+```{r}
+resOrdered <- res[order(res$padj),]
+summary(resOrdered)
+
+sum(resOrdered$padj < 0.1, na.rm=TRUE)
+```
+
+-   MA Plots (code from: <https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#countmat>)
+
+```{r}
+#MA-plot log2 fold changes 
+plotMA(res, ylim=c(-2,2))
+
+#MA-plot for the shrunken log2 fold changes
+plotMA(resLFC, ylim=c(-2,2))
+
+#plot counts of the gene with the smallest p-value
+plotCounts(dds, gene=which.min(res$padj), intgroup="recurrence")
+```
+
+-   **PCA**. By default the function uses the *top 500 most variable genes*.\
+    (code from: <https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#countmat>)
+
+```{r}
+### Transform counts for data visualization
+rld <- vst(dds, blind=TRUE)
+
+### Plot PCA 
+plotPCA(rld, intgroup="recurrence")
+```
+
+-   **Hierarchical clustering\
+    **(code from: <https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#countmat>)
+
+```{r}
+### Extract the rlog matrix from the object
+rld_mat <- assay(rld)    ## assay() is function from the "SummarizedExperiment" package that was loaded when you loaded DESeq2
+
+### Compute pairwise correlation values
+rld_cor <- cor(rld_mat)    ## cor() is a base R function
+
+head(rld_cor)   ## check the output of cor(), make note of the rownames and colnames
+
+
+### Plot heatmap
+pheatmap(rld_cor)
+
+```
+
+# *NanoString Data*
+
+Open the NanoString data:
+
+```{r}
+NanoString <- read_csv("01_PanCancer_IO_360_gene_list.csv")
+```
+
+Now, we have to filter our cts_wide_withnames so that it only gets the rows that are present in NanoString dataframe.
+
+```{r}
+
+unique_values <- (unlist(NanoString))
+
+nanostring_cts <- cts_wide_withnames %>%
+  filter(rownames(cts_wide_withnames) %in% unique_values)
+```
+
+There are 14 genes that are not mapped properly so we need to manage these cases individually.
+
+Need to get the old names of the rows:
+
+```{r}
+names_nanostring <- rownames(nanostring_cts)
+non_mapping <- data.frame()
+
+```
+
+***FCGR3A/B***
+
+```{r}
+FCGR3A <- cts_wide_withnames["FCGR3A", ]
+FCGR3B <- cts_wide_withnames["FCGR3B", ]
+
+FCGR3AB <- FCGR3A + FCGR3B
+
+non_mapping <- rbind(non_mapping, FCGR3AB)
+
+names_nanostring <- c(names_nanostring, "FCGR3A/B")
+```
+
+***H2AFX***
+
+```{r}
+H2AFX <- cts_wide_withnames["H2AX", ]
+
+non_mapping <- rbind(non_mapping, H2AFX)
+
+names_nanostring <- c(names_nanostring, "H2AFX")
+```
+
+***MAGEA3/A6***
+
+```{r}
+MAGEA3 <- cts_wide_withnames["MAGEA3", ]
+MAGEA6 <- cts_wide_withnames["MAGEA6", ]
+
+MAGEA3A6 <- MAGEA3 + MAGEA6
+
+non_mapping <- rbind(non_mapping, MAGEA3A6)
+
+names_nanostring <- c(names_nanostring, "MAGEA3/A6")
+```
+
+**MB21D1**
+
+```{r}
+
+CGAS <- cts_wide_withnames["CGAS",]
+
+non_mapping <- rbind(non_mapping, CGAS)
+
+names_nanostring <- c (names_nanostring, "MB21D1")
+```
+
+**TMEM173**
+
+```{r}
+STING1 <- cts_wide_withnames["STING1", ]
+
+non_mapping <- rbind(non_mapping, STING1)
+
+names_nanostring <- c (names_nanostring, "TMEM173")
+```
+
+**TPSAB1/B2**
+
+```{r}
+
+TPSAB1 <- cts_wide_withnames["TPSAB1", ]
+
+non_mapping <- rbind(non_mapping, TPSAB1)
+
+names_nanostring <- c(names_nanostring, "TPSAB1/B2")
+```
+
+**XCL1/2**
+
+```{r}
+XCL1 <- cts_wide_withnames["XCL1", ]
+
+XCL2 <- cts_wide_withnames["XCL2", ]
+
+XCL12 <- XCL1 + XCL2
+
+non_mapping <- rbind(non_mapping, XCL12)
+
+names_nanostring <- c(names_nanostring, "XCL1/2")
+```
+
+Merge genes to Nanostring dataset
+
+```{r}
+
+nanostring_cts <- rbind(nanostring_cts, non_mapping)
+```
+
+```{r}
+rownames(nanostring_cts) <- unlist(names_nanostring)
+
+```
+
+Repeat the same analysis. Code from Bioconductor as well.
+
+```{r}
+df_nanostring_cts <- apply(nanostring_cts,2,as.character)
+
+#get the coldata info
+coldata_nanostring <- dplyr::distinct(COAD_data_filtered, patient_id_long, recurrence)
+
+#I do not get the difference that adding factor here makes, but added it bc I get a warning 
+coldata_nanostring$recurrence <- factor(coldata_nanostring$recurrence)
+
+#form DESeqDataset
+dds_nanostring <- DESeqDataSetFromMatrix(countData = nanostring_cts,
+                              colData = coldata_nanostring,
+                              design = ~ recurrence)
+
+#run DESeq
+dds_nanostring <- DESeq(dds_nanostring)
+res_nanostring <- results(dds_nanostring, contrast=c("recurrence",1,0))
+
+
+
+res_nanostring$padj <- p.adjust(res_nanostring$pvalue, method = "BH")  
+
+```
+
+Analysis of results:\
+
+```{r}
+resultsNames(dds_nanostring)
+resLFC_nanostring <- lfcShrink(dds_nanostring, coef="recurrence_1_vs_0", type="apeglm")
+
+
+resOrdered_nanostring <- res_nanostring[order(res_nanostring$pvalue),]
+summary(res_nanostring)
+#how many adjusted p-values were less than 0.1
+sum(res_nanostring$padj < 0.1, na.rm=TRUE)
+```
+
+# *Volcano plots*
+
+<https://www.biostars.org/p/282295/>
+
+```{r}
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res)
+
+#Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot of full gene set", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~P~value)))
+
+#filtering those genes with adjusted p-value lower than threshold and also fold change significantly high
+with(subset(topT, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+#significant points
+significant_points_full <- subset(topT, padj<0.05 & abs(log2FoldChange)>2)
+significant_points_full_right <- subset(topT, padj<0.05 & (log2FoldChange)>2)
+significant_points_full_left <- subset(topT, padj<0.05 & (log2FoldChange)<(-2))
+
+#Add lines for absolute FC>2 and P-value cut-off at FDR Q<0.05
+abline(v=0, col="black", lty=3, lwd=1.0)
+abline(v=-2, col="black", lty=4, lwd=2.0)
+abline(v=2, col="black", lty=4, lwd=2.0)
+abline(h=-log10(0.05), col="black", lty=4, lwd=2.0)
+
+#Add data tags?
+```
+
+```{r}
+
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT <- as.data.frame(res)
+
+# Adjusted P values (FDR Q values)
+with(topT, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~P~value)))
+
+# Filtering those genes with adjusted p-value lower than threshold and also fold change significantly high
+significant_points_full <- subset(topT, padj<0.05 & abs(log2FoldChange)>2)
+with(significant_points_full, {
+  points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5)
+  # Add data tags
+  text(log2FoldChange, -log10(padj), labels=rownames(significant_points_full), pos=3, col="blue", cex=0.7)
+})
+
+# Add lines for absolute FC>2 and P-value cut-off at FDR Q<0.05
+abline(v=0, col="black", lty=3, lwd=1.0)
+abline(v=-2, col="black", lty=4, lwd=2.0)
+abline(v=2, col="black", lty=4, lwd=2.0)
+abline(h=-log10(0.05), col="black", lty=4, lwd=2.0)
+
+#change line for alpha=0.05 in log scale
+
+#Not visible but the list we are using for plotting can be used to compare the genes that are significant in two groups
+```
+
+```{r}
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+topT_nanostring <- as.data.frame(res_nanostring)
+
+significant_points_nanostring <- subset(topT_nanostring, padj<0.05 & abs(log2FoldChange)>=2)
+
+#Adjusted P values (FDR Q values)
+with(topT_nanostring, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot of Nanostring set", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~P~value)))
+
+with(subset(topT_nanostring, padj<0.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+
+
+#Add lines for absolute FC>2 and P-value cut-off at FDR Q<0.05
+abline(v=0, col="black", lty=3, lwd=1.0)
+abline(v=-2, col="black", lty=4, lwd=2.0)
+abline(v=2, col="black", lty=4, lwd=2.0)
+abline(h=-log10(0.05), col="black", lty=4, lwd=2.0)
+```
+
+Write the results of the analysis
+
+```{r}
+write.csv(as.data.frame(resOrdered), 
+          file="COAD_DE_results_full.csv")
+
+write.csv(as.data.frame(resOrdered_nanostring), 
+          file="COAD_DE_results_nanostring.csv")
+```
+
+```{r}
+print(significant_points_full)
+print(significant_points_nanostring)
+```
+
+```{r}
+#Check if the most relevant NanoString genes
+
+significant_points_full['SFRP1', ]
+significant_points_full['SPIB', ]
+significant_points_full['MAGEA3', ]
+significant_points_full['MAGEA6', ]
+
+topT['MAGEA3', ]
+topT['MAGEA6', ]
+```
